@@ -211,6 +211,8 @@ class Token:
     currency: Optional[str] = None
     unresolved: list[Candidate] = field(default_factory=list)
     enumeration_sum: Optional[float] = None
+    dual_headline_sum: Optional[float] = None
+    dual_headline_ccy: Optional[str] = None
 
     def is_deal_level(self) -> bool:
         return self.level in ("DEAL", "BOTH")
@@ -307,6 +309,7 @@ def build_output(deals: Iterable[Deal]) -> list[dict[str, Any]]:
             obj["BOND_ATTRITION"] = row.bond_attr
             obj["DEAL_ATTRITION"] = deal.deal_attr
             obj["BOND_ATTRITION_COMMENTS"] = row.comment_text
+            obj["TRANCHE_TYPE"] = "MULTI" if deal.is_multi else "SINGLE"
             obj["ATTRITION"] = None
             out.append(obj)
     return out
@@ -444,22 +447,84 @@ def shared_ouh_keys(deal: Deal) -> set[str]:
     return {k for k, n in counts.items() if n >= 2}
 
 
+def sole_ouh_row(deal: Deal) -> Optional[Row]:
+    """The one row carrying any OUH text, if every sibling row's OUH is empty.
+
+    A multi-tranche deal where only one row has an orderbook history at all —
+    every other row's OUH is blank — leaves no other tranche this narrative
+    could belong to, so it is the whole deal's book-building history even
+    without a "combined" keyword, a duplicate to match against (§4a), or a
+    structural split/enumeration (§4b).
+    """
+    if not deal.is_multi:
+        return None
+    rows_with_ouh = [r for r in deal.rows
+                     if r.source.get("ORDERBOOK_UPDATE_HISTORY")]
+    return rows_with_ouh[0] if len(rows_with_ouh) == 1 else None
+
+
 def classify_tokens(deal: Deal) -> None:
     shared = shared_ouh_keys(deal)
+    sole_row = sole_ouh_row(deal)
     for row in deal.rows:
         row_key = normalise_ouh(row.source.get("ORDERBOOK_UPDATE_HISTORY"))
         for tok in row.tokens:
             tok.is_closing = bool(CLOSING.search(tok.text))
-            if DEAL_MARKERS.search(tok.text):
+            # §4: classify off noise-masked text, not the raw cleaned text. A
+            # tenor/NC/date mention that is just incidental colour on an
+            # otherwise deal-wide headline (e.g. "skewed to 7yr") must not be
+            # mistaken for a genuine per-bond label just because it happens to
+            # sit in the same sentence. mask_noise(text, False) applies the
+            # same NOISE_PATTERNS used in §5.3 but skips BREAKDOWN_PATTERNS,
+            # which needs a level we don't have yet — that part still runs
+            # unchanged, later, in extract_amounts_pass1 (§5).
+            classify_text = mask_noise(tok.text, False)
+
+            # §4a: an OUH message that is byte-identical across every tranche
+            # is a whole-deal broadcast — trust that over any tenor/NC/date or
+            # instrument-type (FRN/FXD/Fixed/Tap) wording sitting inside it.
+            # That wording can be purely incidental colour ("skewed to 5Y
+            # FRN"), and even when it's a genuine per-instrument figure, this
+            # check runs after DEAL_MARKERS, so an explicit combined total
+            # elsewhere in the same shared message has already won. Restricted
+            # to OUH: an OIS token is never a cross-tranche broadcast — it's
+            # always this row's own interest split.
+            is_shared_ouh = (deal.is_multi and tok.field_name == "OUH"
+                             and row_key in shared)
+
+            # §4a2: this row is the ONLY tranche with any OUH narrative at all
+            # — every sibling row's OUH is empty. There's no other tranche's
+            # own commentary this message could instead be describing, so
+            # trust it as deal-wide for the same reason as §4a above, even
+            # without a duplicate to match against.
+            is_sole_ouh_holder = (deal.is_multi and tok.field_name == "OUH"
+                                  and sole_row is row)
+
+            # §4b: an OUH sentence that structurally lists more than one
+            # amount — "(split a/b)" or "a and b respectively" — describes the
+            # whole deal even when it's recorded against only one row (so the
+            # "identical on ≥2 rows" check above never fires) and even when a
+            # tenor label elsewhere in the sentence would otherwise trip
+            # BOND_LABEL.
+            structural_breakdown = (
+                deal.is_multi and tok.field_name == "OUH"
+                and (any(p.search(classify_text) for p in BREAKDOWN_PATTERNS)
+                     or re.search(r"respectively", classify_text, re.I)))
+
+            if DEAL_MARKERS.search(classify_text):
                 tok.level = "DEAL"
-            elif BOND_LABEL.search(tok.text):
+            elif is_shared_ouh:
+                tok.level = "DEAL"
+            elif is_sole_ouh_holder:
+                tok.level = "DEAL"
+            elif structural_breakdown:
+                tok.level = "DEAL"
+            elif BOND_LABEL.search(classify_text):
                 tok.level = "BOND"
             elif not deal.is_multi:
                 tok.level = "BOTH"
-            elif tok.field_name == "OIS":
-                tok.level = "BOND"
             else:
-                tok.level = "DEAL" if row_key in shared else "BOND"
+                tok.level = "BOND"
 
 
 # --------------------------------------------------------------------------
@@ -486,7 +551,12 @@ def mask_noise(text: str, deal_level: bool) -> str:
 
 _NUMBER = re.compile(
     r"(?P<cur>" + CUR_RE + r")?\s*"
-    r"(?P<num>\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
+    # The comma-grouped branch must REQUIRE at least one ",ddd" group (`+`,
+    # not `*`). With `*` it matches successfully on just the first 1-3 digits
+    # of a plain, comma-less number too (regex tries alternatives left to
+    # right, not longest-match-wins) — so "1650" silently read as "165" and
+    # "1000" as "100", never reaching the plain-number fallback below.
+    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
     r"\s*\+?\s*\.?\s*"
     r"(?P<tail>[A-Za-z€£¥$]*)"
 )
@@ -550,6 +620,12 @@ def _is_bare_enumeration(text: str, cands: list[Candidate], masked: str) -> bool
     for a, b in zip(cands, cands[1:]):
         between = masked[a.position:b.position]
         between = re.sub(r"^\s*[\d,.]+\s*[A-Za-z€£¥$]*", "", between)
+        # `b.position` marks the start of the NEXT number, excluding any
+        # currency symbol/code that precedes it ("€850m and €2.6bn" — b.position
+        # is where "2.6" starts, not "€"). That leaves b's own currency marker
+        # sitting in `between`, e.g. " and €", which otherwise never matches a
+        # bare separator. Strip it before checking.
+        between = re.sub(r"(?:" + CUR_RE + r")\s*$", "", between)
         if not ENUM_SEPARATOR.match(between):
             return False
     return True
@@ -576,12 +652,35 @@ def select_headline(tok: Token, cands: list[Candidate], deal: Deal
 
 
 def extract_amounts_pass1(deal: Deal) -> None:
+    shared = shared_ouh_keys(deal)
+    sole_row = sole_ouh_row(deal)
     for row in deal.rows:
+        row_key = normalise_ouh(row.source.get("ORDERBOOK_UPDATE_HISTORY"))
+        # A sole-OUH-holder row (§4a2) is just as much a deal-wide broadcast
+        # as a duplicated one — a genuine two-tenor breakdown with no overall
+        # total ("5y: EUR1.9bn 7y: EUR2.0bn") needs its two amounts summed
+        # here the same way, or reclassifying it to DEAL in classify_tokens
+        # would silently drop the second tenor's amount via select_headline's
+        # first-candidate rule instead of fixing anything.
+        row_shared = deal.is_multi and (row_key in shared or sole_row is row)
         for tok in row.tokens:
             tok.masked = mask_noise(tok.text, tok.is_deal_level())
             cands = find_amounts(tok.masked)
             amount, ccy, unresolved = select_headline(tok, cands, deal)
             tok.amount, tok.currency, tok.unresolved = amount, ccy, unresolved
+
+            # §6.2b: a shared OUH message with two headline amounts and no
+            # overall total (e.g. "Books 5Yr: EUR1.8bn+ 10Yr: EUR2.8bn+") is a
+            # per-tranche breakdown broadcast to every row, often misclassified
+            # BOND because a tenor label (BOND_LABEL) precedes each figure. The
+            # deal peak for that update is the sum of both headline amounts,
+            # not just the first one `select_headline` would otherwise keep.
+            if (row_shared and tok.field_name == "OUH" and len(cands) == 2
+                    and all(c.unit is not None for c in cands)):
+                values = [c.to_millions() for c in cands]
+                tok.dual_headline_sum = sum(v for v in values if v is not None)
+                tok.dual_headline_ccy = next(
+                    (c.currency for c in cands if c.currency), None)
 
 
 OUTLIER_FACTOR = 10.0
@@ -699,6 +798,11 @@ def compute_bond_peak(row: Row, deal: Deal) -> None:
         row.add_comment("BOND: BOND_PEAK_VALUE missing")
 
 
+def _dual_headline_tokens(deal: Deal) -> list[Token]:
+    return [t for r in deal.rows for t in r.tokens
+            if t.dual_headline_sum is not None and not t.is_closing]
+
+
 def compute_deal_peak(deal: Deal) -> None:
     if not deal.is_multi:
         row = deal.rows[0]
@@ -710,11 +814,20 @@ def compute_deal_peak(deal: Deal) -> None:
 
     peaks = [r.bond_peak for r in deal.rows]
     ccys = {r.bond_peak_ccy for r in deal.rows if r.bond_peak_ccy is not None}
+    dual_tokens = _dual_headline_tokens(deal)
 
     if all(isinstance(p, float) for p in peaks):
         if len(ccys) <= 1:
             deal.deal_peak = sum(peaks)                     # PRIMARY rule (§6.2)
             deal.deal_peak_ccy = next(iter(ccys), None)
+            # §6.2b: a shared OUH token's two-headline sum can exceed the sum
+            # of each tranche's own (later-dated) peak — take the larger.
+            best_dual = max((t for t in dual_tokens
+                             if t.dual_headline_ccy in (None, deal.deal_peak_ccy)),
+                            key=lambda t: t.dual_headline_sum, default=None)
+            if best_dual is not None and best_dual.dual_headline_sum > deal.deal_peak:
+                deal.deal_peak = best_dual.dual_headline_sum
+                deal.deal_peak_ccy = best_dual.dual_headline_ccy or deal.deal_peak_ccy
             return
         deal.deal_peak = NA
         deal.add_comment_all("DEAL: mixed-currency tranches, peak not summable")
@@ -723,13 +836,18 @@ def compute_deal_peak(deal: Deal) -> None:
     deal_tokens = [t for r in deal.rows for t in r.tokens
                    if t.is_deal_level() and not t.is_closing
                    and (t.amount is not None or t.enumeration_sum is not None)]
-    if deal_tokens:
-        best = max(deal_tokens,
-                   key=lambda t: t.amount if t.amount is not None
-                   else t.enumeration_sum)
-        deal.deal_peak = (best.amount if best.amount is not None
-                          else best.enumeration_sum)
-        deal.deal_peak_ccy = best.currency
+    candidates = deal_tokens + dual_tokens
+    if candidates:
+        def value_of(t: Token) -> float:
+            if t.dual_headline_sum is not None:
+                return t.dual_headline_sum
+            return t.amount if t.amount is not None else t.enumeration_sum
+
+        best = max(candidates, key=value_of)
+        deal.deal_peak = value_of(best)
+        deal.deal_peak_ccy = (best.dual_headline_ccy
+                              if best.dual_headline_sum is not None
+                              else best.currency)
     else:
         deal.deal_peak = NA
         deal.add_comment_all("DEAL: DEAL_PEAK_VALUE missing")
@@ -771,6 +889,39 @@ def _subtract(peak: Value, final: Optional[float], scope: str,
 
 
 def compute_attrition(deal: Deal) -> None:
+    if deal.is_multi:
+        populated = [r for r in deal.rows if r.final is not None]
+        deal_level_final: Optional[float] = None
+        deal_level_reason: Optional[str] = None
+        if len(populated) == 1:
+            # §7.1: FINAL_ORDER_BOOK_SIZE is populated for exactly one tranche.
+            # On a multi-tranche deal that single value represents the deal's
+            # final book size, not that tranche's — there is no way to allocate
+            # it across tranches, so every BOND_ATTRITION is N/A. DEAL_ATTRITION
+            # still computes, using that value as the deal's final.
+            deal_level_final = populated[0].final
+            deal_level_reason = (
+                "BOND: FINAL_ORDER_BOOK_SIZE populated for only one tranche "
+                "(represents the deal total, not allocable to a bond)")
+        elif (len(populated) == len(deal.rows)
+              and len({r.final for r in populated}) == 1):
+            # §7.2: every tranche carries the identical FINAL_ORDER_BOOK_SIZE
+            # value — that is the deal total copied across tranches, not each
+            # tranche's own figure, so it cannot be allocated per bond either.
+            deal_level_final = populated[0].final
+            deal_level_reason = (
+                "BOND: FINAL_ORDER_BOOK_SIZE identical across all tranches "
+                "(represents the deal total, not allocable to a bond)")
+
+        if deal_level_reason is not None:
+            deal.add_comment_all(deal_level_reason)
+            for row in deal.rows:
+                row.bond_attr = NA
+            deal.deal_attr = _subtract(deal.deal_peak, deal_level_final, "DEAL",
+                                       deal.rows, deal.deal_peak_ccy,
+                                       deal.deal_peak_ccy)
+            return
+
     for row in deal.rows:
         row.bond_attr = _subtract(row.bond_peak, row.final, "BOND", [row],
                                   row.bond_peak_ccy, row.bond_peak_ccy)
