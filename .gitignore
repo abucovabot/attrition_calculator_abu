@@ -4,3 +4,4 @@
 .claude
 /scripts/__pycache__
 .DS_Store
+/server_output
